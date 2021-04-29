@@ -117,7 +117,7 @@ struct playing_note_t {
 
   playing_note_t()
     : instrument(0)
-    , step(1.f)
+    , step(0.f)
     , position(0)
   {
   }
@@ -145,7 +145,6 @@ struct player_t {
     , _playback_pos{0}
     , _note(nullptr)
     , _sample_rate(sample_rate)
-    , _note_head(0)
   {
   }
 
@@ -196,7 +195,6 @@ protected:
   const uint32_t _sample_rate;
   // currently playing note stack
   std::array<playing_note_t, MAX_NOTES_PLAYING> _note_stack;
-  uint32_t _note_head;
 
   // render thread mutex
   std::mutex _mutex;

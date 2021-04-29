@@ -32,7 +32,7 @@ float samples_to_beats(uint32_t sample_rate, uint32_t bpm, uint32_t samples) {
 
 float note_to_rate(float note, float root) {
   // where root is typicaly 69
-  return powf(2.f, (note - root) / 12.f);
+  return powf(2.f, ((note - 69) + (root - 69)) / 12.f);
 }
 
 }  // namespace
@@ -60,15 +60,24 @@ void pattern_t::note_insert(const note_t &n) {
 }
 
 void pattern_t::note_remove(const note_t &n) {
-  // make sure note to remove is part of this pattern
-  assert(&n >= &*notes.begin() && &n < &notes[notes_head]);
-  uint32_t i = uint32_t((uintptr_t(&n) - uintptr_t(notes.data())) / sizeof(note_t));
-  // compact array
-  for (; i < notes_head; ++i) {
-    notes[i] = notes[i + 1];
+  bool found = false;
+  uint8_t i = 0;
+  for (i = 0; i < notes_head; ++i) {
+    if (notes[i].start != n.start) {
+      continue;
+    }
+    if (notes[i].instrument != n.instrument) {
+      continue;
+    }
+    if (notes[i].note != n.note) {
+      continue;
+    }
+    for (; i < notes_head; ++i) {
+      notes[i] = notes[i + 1];
+    }
+    --notes_head;
+    break;
   }
-  // mark one note as removed
-  --notes_head;
 }
 
 void playing_note_t::_trigger(const player_t &player, const note_t &note) {
@@ -83,11 +92,15 @@ void playing_note_t::_trigger(const player_t &player, const note_t &note) {
 void player_t::stop() {
   std::lock_guard<std::mutex> guard{ _mutex };
   _playing = false;
+  _playback_pos = 0;
+  _note = nullptr;
 }
 
 void player_t::play() {
   std::lock_guard<std::mutex> guard{ _mutex };
   _playing = true;
+  _playback_pos = 0;
+  _note = nullptr;
 }
 
 void player_t::set_pattern(uint32_t index) {
@@ -98,13 +111,14 @@ void player_t::set_pattern(uint32_t index) {
   _note = nullptr;
 }
 
-void player_t::play_note(const note_t &n) {
+void player_t::play_note(const note_t &note) {
   std::lock_guard<std::mutex> guard{ _mutex };
-  // insert the note into the note stack
-  if (_note_head < _note_stack.size()) {
-    auto &slot = _note_stack[_note_head];
-    ++_note_head;
-    slot._trigger(*this, n);
+  // insert into the note stack
+  for (auto &n : _note_stack) {
+    if (n.step == 0.f) {
+      n._trigger(*this, note);
+      return;
+    }
   }
 }
 
@@ -136,49 +150,55 @@ void player_t::_on_pattern_end() {
 void player_t::render(int16_t *out, uint32_t samples) {
   // grab a lock so that no-one can change our data while
   // we are using it
-  std::lock_guard<std::mutex> lock(_mutex);
-  if (_playing) {
-    // repeat until all samples have been rendered
-    while (samples) {
-      uint32_t done = _render_samples(out, samples);
-      samples -= done;
-      out += done;
+  if (_mutex.try_lock()) {
+    if (_playing) {
+      // repeat until all samples have been rendered
+      while (samples) {
+        uint32_t done = _render_samples(out, samples);
+        samples -= done;
+        out += done;
+      }
     }
+    _mutex.unlock();
+  }
+  else {
+    // clear samples?
   }
 }
 
 uint32_t player_t::_render_samples(int16_t *out, uint32_t samples) {
   // get the next note
   const note_t *next = _next_note(_note);
+
   // time until next note
-  const auto diff = next ? (next->start - _playback_pos) :
-                           (PAT_END_POS - _playback_pos);
-  assert(diff >= 0);
+  auto diff = next ? (next->start - _playback_pos) :
+                     (PAT_END_POS - _playback_pos);
+  if (diff < 0.f) {
+    diff = 0;
+  }
   // number of samples until the next note
   const uint32_t max_samples = beats_to_samples(_sample_rate, _song.bpm, diff);
   // max samples we can render
   const uint32_t num_samples = std::min(samples, max_samples);
   // render each note in turn
-  uint32_t j = 0;
-  for (uint32_t i = 0; i < _note_head; ++i) {
-    playing_note_t &n = _note_stack[i];
+  for (auto &n : _note_stack) {
+    // skip notes that are not playing
+    if (n.step == 0.f) {
+      continue;
+    }
     // render this instrument
     if (n._render_samples(*this, out, num_samples)) {
-      // sample has finished so we leave j unchanged so the list will get
-      // compacted
-    }
-    else {
-      ++j;
-    }
-    // if we have lost a sample we must compact the list
-    if (j != i) {
-      _note_stack[j] = _note_stack[i];
+      // sample has finished
+      n.step = 0.f;
     }
   }
   // update the playback position
   _playback_pos += samples_to_beats(_sample_rate, _song.bpm, num_samples);
-  // update _note_head to be the same as j to reflect any notes finishing
-  _note_head = j;
+
+  if (_playback_pos >= PAT_END_POS) {
+    _playback_pos = PAT_END_POS;
+  }
+
   // if we rendered enough to read the next note
   if (num_samples == max_samples) {
     if (next) {
@@ -193,45 +213,41 @@ uint32_t player_t::_render_samples(int16_t *out, uint32_t samples) {
 }
 
 bool playing_note_t::_render_samples(const player_t &player, int16_t *out, uint32_t samples) {
+  if (step == 0.f) {
+    return true;
+  }
   const song_t &song = player._song;
   const instrument_t &inst = song.instruments[instrument];
   const int16_t *samp = inst.sample.data.get();
   for (uint32_t i = 0; i < samples; ++i) {
     const uint32_t p = uint32_t(position);
     if (p >= inst.sample_end) {
+      // note has finished
+      step = 0.f;
       return true;
     }
     // we mix with the output stream here
-    out[i] = samp[p];
+    out[i] += (int32_t(samp[p]) * 12) >> 8;
     // increment the playback position
     position += step;
   }
   return false;
 }
 
-
 void player_t::_on_note(const note_t *note) {
   // we have now reached this note
   _note = note;
   // 
-  for (size_t i = 0; i < _note_head; ++i) {
-    playing_note_t &n = _note_stack[i];
-    if (n.instrument == note->instrument) {
-      const instrument_t &inst = _song.instruments[n.instrument];
-      // retrigger existing note
-      n._trigger(*this, *note);
-      return;
+  playing_note_t *out = nullptr;
+  for (auto &n : _note_stack) {
+    if (n.step == 0.f) {
+      out = &n;
+      break;
     }
   }
-  // no more note slots
-  if (_note_head == _note_stack.size()) {
-    return;
-  }
-  // add a new note
-  {
-    playing_note_t &n = _note_stack[_note_head++];
-    const instrument_t &inst = _song.instruments[n.instrument];
-    n._trigger(*this, *note);
+  if (out) {
+    // trigger the new note
+    out->_trigger(*this, *note);
   }
 }
 
